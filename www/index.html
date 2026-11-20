@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XSX 局域网直播画面</title>
+<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000}video{width:100%;height:100%;object-fit:contain}#status,#sound{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font:20px system-ui;color:white;background:#171b22;padding:18px 24px;border:0;border-radius:10px}#sound{cursor:pointer}*[hidden]{display:none!important}</style></head>
+<body><video id="video" autoplay playsinline></video><div id="status">正在连接 XSX…</div><button id="sound" hidden>点击开启声音</button>
+<script src="vendor/mpegts-1.8.2.js"></script><script>
+'use strict';
+const video=document.getElementById('video'),status=document.getElementById('status'),sound=document.getElementById('sound');
+let player=null,retry=null,lastTime=-1,lastProgress=Date.now();
+video.muted=new URLSearchParams(location.search).get('audio')==='0';
+function dispose(){if(player){try{player.unload();player.detachMediaElement();player.destroy();}catch(e){}player=null;}}
+function reconnect(){if(retry)return;status.textContent='等待 XSX 画面，正在重连…';status.hidden=false;dispose();retry=setTimeout(()=>{retry=null;connect();},2000);}
+function play(){if(!player)return;player.play().catch(()=>{video.muted=true;sound.hidden=false;if(player)player.play().catch(()=>{});});}
+function connect(){
+ if(!window.mpegts||!mpegts.getFeatureList().mseLivePlayback){status.textContent='当前浏览器不支持 MSE 网络视频';return;}
+ dispose();lastProgress=Date.now();lastTime=-1;
+ player=mpegts.createPlayer({type:'flv',url:location.origin+'/live/xsx.flv',isLive:true,hasAudio:true,hasVideo:true},{enableWorker:true,enableStashBuffer:false,lazyLoad:false,liveBufferLatencyChasing:true,liveBufferLatencyMaxLatency:1.5,liveBufferLatencyMinRemain:0.5,autoCleanupSourceBuffer:true});
+ player.on(mpegts.Events.ERROR,()=>reconnect());player.attachMediaElement(video);player.load();play();
+}
+sound.onclick=()=>{video.muted=false;video.play().then(()=>sound.hidden=true).catch(()=>{});};
+video.addEventListener('playing',()=>{status.hidden=true;lastProgress=Date.now();});
+setInterval(()=>{if(!player||video.paused)return;if(video.currentTime!==lastTime){lastTime=video.currentTime;lastProgress=Date.now();}else if(Date.now()-lastProgress>12000){reconnect();}},2000);
+window.addEventListener('beforeunload',()=>{clearTimeout(retry);dispose();});connect();
+</script></body></html>

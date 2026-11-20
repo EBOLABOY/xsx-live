@@ -1,0 +1,4 @@
+{
+  "client_id": "YOUR_XBOX_OAUTH_CLIENT_ID",
+  "refresh_token": "YOUR_XBOX_OAUTH_REFRESH_TOKEN"
+}

@@ -1,0 +1,60 @@
+name: xsx-live
+
+services:
+  media:
+    image: ossrs/srs:5
+    container_name: xsx-media
+    restart: unless-stopped
+    command: ["./objs/srs", "-c", "conf/xsx.conf"]
+    volumes:
+      - ./srs.conf:/usr/local/srs/conf/xsx.conf:ro
+      - ./www:/usr/local/srs/objs/nginx/html/xsx:ro
+    ports:
+      - "${BIND_IP:-0.0.0.0}:1935:1935/tcp"
+      - "${BIND_IP:-0.0.0.0}:8888:8080/tcp"
+      - "127.0.0.1:1985:1985/tcp"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  receiver:
+    image: xsx-native:local
+    build:
+      context: ./receiver
+    container_name: xsx-receiver
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    environment:
+      XBOX_IP: "${XBOX_IP:-192.168.1.180}"
+      XBOX_AUTH_FILE: /auth/session.json
+      STATE_DIR: /state
+      DASHBOARD_BIND: "${DASHBOARD_BIND:-0.0.0.0:8099}"
+      DASHBOARD_DIR: /dashboard
+      MEDIA_HTTP_BASE: "${MEDIA_HTTP_BASE:-http://127.0.0.1:8888}"
+      OUTPUT_RTMP: "${OUTPUT_RTMP:-rtmp://127.0.0.1:1935/live/xsx}"
+    volumes:
+      - ./auth:/auth
+      - ./state:/state
+      - ./dashboard:/dashboard:ro
+    depends_on:
+      - media
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/xsx-native", "--healthcheck"]
+      interval: 20s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

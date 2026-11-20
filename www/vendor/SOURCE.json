@@ -1,0 +1,6 @@
+{
+  "package": "mpegts.js",
+  "version": "1.8.2",
+  "registry_integrity": "sha512-cZYMa5muASH55wrS6JK5IGkUqnCA96c0f+WdnW91jIK9s/N6NzjmTQDJNYg9A5u/G2Q5nj2b3w1Zwzze/9guxA==",
+  "upstream": "https://github.com/xqq/mpegts.js/releases/tag/v1.8.2"
+}
