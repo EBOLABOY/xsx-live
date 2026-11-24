@@ -17,6 +17,16 @@ fn uuid()->String{
 fn write_dc(rtc:&mut Rtc,id:Option<ChannelId>,v:&impl serde::Serialize){
  if let Some(id)=id {if let Some(mut ch)=rtc.channel(id) {let _=ch.write(true,&serde_json::to_vec(v).expect("protocol serialization"));}}
 }
+fn send_gamepad(rtc:&mut Rtc,id:Option<ChannelId>,seq:&mut u32,frame:&xsx_native::rtc::input::GamepadFrame,elapsed:Duration){
+ let bytes=xsx_native::rtc::input::encode_gamepad(frame,*seq,elapsed.as_secs_f64()*1000.0);*seq=seq.wrapping_add(1);
+ if let Some(id)=id {if let Some(mut ch)=rtc.channel(id) {let _=ch.write(true,&bytes);}}
+}
+// 会话保活：主机在约 60 秒没收到输入报告时会用 KickForNoClientConnection 结束会话。
+// 做法是「打个招呼」——注册手柄 0，发几帧中立输入，再把手柄松开；之后主机就会一直保留
+// 这个安静的会话。松开后手柄槽位归还本机，不影响主机上的物理手柄。
+fn release_pad(rtc:&mut Rtc,control:Option<ChannelId>){
+ let mut removed=protocol::gamepad_changed();removed.was_added=false;write_dc(rtc,control,&removed);
+}
 #[tokio::main]
 async fn main()->Result<()> {
  tracing_subscriber::fmt().with_ansi(false).with_env_filter("warn").init();
@@ -133,6 +143,8 @@ async fn receive(client:&XHomeClient,path:&str,revision:u64)->Result<()>{
  println!("LAN_ONLY peer={} local={}",xbox_ip,local.ip());
  let mut relay=match std::env::var("OUTPUT_RTMP"){Ok(url)=>Some(MediaRelay::new(&url)?),Err(_)=>None};
  let mut last_video=Instant::now();let mut input_seq=0u32;let mut last_keyframe=Instant::now();
+ let idle_keepalive_enabled=std::env::var("IDLE_KEEPALIVE").map(|v|v.trim()!="0").unwrap_or(true);
+ let mut hello_frames_left=0u8;let mut release_pad_pending=false;
  
  let started=Instant::now();let mut vf=0u64;let mut af=0u64;let mut vb=0u64;let mut ab=0u64;let mut keyframes=0u64;
  let mut connected=false;let mut handshake=false;let mut buf=vec![0u8;65536];
@@ -149,9 +161,12 @@ async fn receive(client:&XHomeClient,path:&str,revision:u64)->Result<()>{
      Event::ChannelData(data)=>{
       match protocol::parse_message(&data.data){
       InboundMsg::HandshakeAck if !handshake=>{handshake=true;println!("XBOX_HANDSHAKE_ACK");write_dc(&mut rtc,control,&protocol::control_authorization());write_dc(&mut rtc,control,&protocol::gamepad_changed());
-       let mut removed=protocol::gamepad_changed();removed.was_added=false;write_dc(&mut rtc,control,&removed);
        let bytes=xsx_native::rtc::input::encode_client_metadata(input_seq,started.elapsed().as_secs_f64()*1000.0);input_seq=input_seq.wrapping_add(1);if let Some(id)=input {if let Some(mut ch)=rtc.channel(id){let _=ch.write(true,&bytes);}}println!("CLIENT_METADATA_SENT_AFTER_AUTH");
-       for m in protocol::config_messages(uuid){write_dc(&mut rtc,message,&m);}write_dc(&mut rtc,control,&protocol::keyframe_request());}
+       for m in protocol::config_messages(uuid){write_dc(&mut rtc,message,&m);}write_dc(&mut rtc,control,&protocol::keyframe_request());
+       hello_frames_left=2;release_pad_pending=true;}
+      InboundMsg::ServerDisconnect(protocol::DisconnectReason::WarningForBeingIdle{seconds_until_kick})=>{
+       if idle_keepalive_enabled{println!("IDLE_WARNING seconds_until_kick={seconds_until_kick}");if !release_pad_pending{write_dc(&mut rtc,control,&protocol::gamepad_changed());}hello_frames_left=2;release_pad_pending=true;}
+      }
       InboundMsg::ServerDisconnect(reason)=>bail!("Server disconnected: {:?}",reason),_=>{}
      }},
      Event::MediaData(data)=>{
@@ -181,7 +196,10 @@ async fn receive(client:&XHomeClient,path:&str,revision:u64)->Result<()>{
     if !connected{if let Ok(candidates)=client.poll_ice_candidates(path).await{for c in candidates{let parts=c.candidate.split_whitespace().collect::<Vec<_>>();if parts.get(4).is_some_and(|v|*v==xbox_ip.to_string()){if let Ok(c)=Candidate::from_sdp_string(&c.candidate){rtc.add_remote_candidate(c);}}}}}
     if handshake {
      if last_keyframe.elapsed()>Duration::from_secs(2){write_dc(&mut rtc,control,&protocol::keyframe_request());last_keyframe=Instant::now();}
-     if let Some(id)=input{let mut bytes=[0u8;15];bytes[0..2].copy_from_slice(&2u16.to_le_bytes());bytes[2..6].copy_from_slice(&input_seq.to_le_bytes());bytes[6..14].copy_from_slice(&(started.elapsed().as_secs_f64()*1000.0).to_le_bytes());input_seq=input_seq.wrapping_add(1);if let Some(mut ch)=rtc.channel(id){let _=ch.write(true,&bytes);}}
+     if hello_frames_left>0{
+      send_gamepad(&mut rtc,input,&mut input_seq,&xsx_native::rtc::input::GamepadFrame::neutral(),started.elapsed());
+      hello_frames_left-=1;println!("PAD_HELLO frames_left={hello_frames_left}");
+     }else if release_pad_pending{release_pad(&mut rtc,control);release_pad_pending=false;println!("PAD_RELEASED");}
     }
    }
   }
