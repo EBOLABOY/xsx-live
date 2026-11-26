@@ -3,13 +3,12 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::{Bytes, Incoming}, header, server::conn::http1, service::service_fn, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::{watch, Mutex}};
 use crate::control::{Command, ControlState};
 
 struct App {
-    host: String,
-    origin: String,
+    bind: SocketAddr,
     csrf: String,
     control: watch::Sender<ControlState>,
     mutation: Mutex<()>,
@@ -38,8 +37,8 @@ fn error(status: StatusCode, message: &str) -> Reply {
 }
 
 pub async fn start(control: watch::Sender<ControlState>) -> Result<()> {
-    let bind = std::env::var("DASHBOARD_BIND").unwrap_or_else(|_| "0.0.0.0:8099".into());
-    let origin = format!("http://{bind}");
+    let bind: SocketAddr = std::env::var("DASHBOARD_BIND").unwrap_or_else(|_| "0.0.0.0:8099".into())
+        .parse().context("DASHBOARD_BIND 要写成「IP:端口」")?;
     let dir = PathBuf::from(std::env::var("DASHBOARD_DIR").unwrap_or_else(|_| "/dashboard".into()));
     let mut files = HashMap::new();
     for (route, name, mime) in [
@@ -53,13 +52,13 @@ pub async fn start(control: watch::Sender<ControlState>) -> Result<()> {
     let csrf = random.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let listener = TcpListener::bind(&bind).await.context("Dashboard listen")?;
     let app = Arc::new(App {
-        host: bind, origin, csrf, control, mutation: Mutex::new(()),
+        bind, csrf, control, mutation: Mutex::new(()),
         state_dir: PathBuf::from(std::env::var("STATE_DIR").unwrap_or_else(|_| "/state".into())),
         files, http: reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?,
         media_base: std::env::var("MEDIA_HTTP_BASE").unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
         rtmp: std::env::var("OUTPUT_RTMP").unwrap_or_else(|_| "rtmp://127.0.0.1:1935/live/xsx".into()),
     });
-    println!("DASHBOARD listening={}", app.origin);
+    println!("DASHBOARD listening={bind}");
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -79,12 +78,17 @@ pub async fn start(control: watch::Sender<ControlState>) -> Result<()> {
     Ok(())
 }
 
-fn origin_allowed(headers: &hyper::HeaderMap, app: &App) -> bool {
-    headers.get(header::HOST).and_then(|v| v.to_str().ok()) == Some(app.host.as_str())
-        && headers.get(header::ORIGIN).is_none_or(|v| v.to_str().ok() == Some(app.origin.as_str()))
+// Host 必须是「IP:端口」且端口和监听端口一致，Origin（带了的话）必须和 Host 同源。
+// 不能拿 Host 和监听地址按字面比较：监听 0.0.0.0 时浏览器发来的是实际访问的 IP，
+// 字面比较会让管理页怎么都打不开。只认 IP 不认域名，也顺带挡住 DNS 重绑定
+fn origin_allowed(headers: &hyper::HeaderMap, bind: SocketAddr) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else { return false };
+    let Ok(addr) = host.parse::<SocketAddr>() else { return false };
+    addr.port() == bind.port()
+        && headers.get(header::ORIGIN).is_none_or(|v| v.to_str().ok() == Some(format!("http://{host}").as_str()))
 }
 
-async fn status(app: &App) -> Value {
+async fn status(app: &App, access_host: &str) -> Value {
     let receiver: Value = std::fs::read(app.state_dir.join("status.json")).ok()
         .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(json!({"state":"unknown"}));
     let control = app.control.borrow().clone();
@@ -100,12 +104,13 @@ async fn status(app: &App) -> Value {
     let base = app.media_base.trim_end_matches('/');
     json!({
         "now":chrono::Utc::now().timestamp(),
+        "access_host":access_host,
         "control":control,
         "receiver":receiver,
         "media":media,
         "csrf_token":app.csrf,
         "links":{
-            "dashboard":format!("{}/",app.origin),
+            "dashboard":format!("{}/",access_host),
             "browser":format!("{base}/xsx/index.html"),
             "flv":format!("{base}/live/xsx.flv"),
             "rtmp":app.rtmp,
@@ -115,12 +120,15 @@ async fn status(app: &App) -> Value {
 }
 
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Reply, Infallible> {
-    if !origin_allowed(req.headers(), &app) {
+    if !origin_allowed(req.headers(), app.bind) {
         return Ok(error(StatusCode::FORBIDDEN, "不允许的访问来源"));
     }
     let path = req.uri().path().to_owned();
     if req.method() == Method::GET {
-        if path == "/api/status" { return Ok(json_response(StatusCode::OK, status(&app).await)); }
+        if path == "/api/status" {
+            let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+            return Ok(json_response(StatusCode::OK, status(&app, &host).await));
+        }
         if path == "/favicon.ico" { return Ok(response(StatusCode::NO_CONTENT, "image/x-icon", Bytes::new())); }
         if let Some((mime, data)) = app.files.get(path.as_str()) {
             return Ok(response(StatusCode::OK, mime, data.clone()));
@@ -155,4 +163,35 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Reply, Infallib
     }
     Ok(json_response(if changed {StatusCode::ACCEPTED} else {StatusCode::OK},
         json!({"accepted":true,"changed":changed,"control":after})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut map = hyper::HeaderMap::new();
+        for (name, value) in pairs { map.insert(hyper::header::HeaderName::try_from(*name).unwrap(), value.parse().unwrap()); }
+        map
+    }
+
+    // 监听 0.0.0.0 时，浏览器发来的 Host 是实际访问的 IP：端口一致就该放行（原版按字面比较全是 403）
+    #[test]
+    fn host_is_accepted_when_the_port_matches() {
+        let bind: SocketAddr = "0.0.0.0:8099".parse().unwrap();
+        assert!(origin_allowed(&headers(&[("host", "192.0.2.10:8099")]), bind));
+        assert!(origin_allowed(&headers(&[("host", "127.0.0.1:8099")]), bind));
+        let same_origin = headers(&[("host", "192.0.2.10:8099"), ("origin", "http://192.0.2.10:8099")]);
+        assert!(origin_allowed(&same_origin, bind), "Origin 和 Host 同源要放行");
+    }
+
+    #[test]
+    fn host_with_wrong_port_or_domain_is_rejected() {
+        let bind: SocketAddr = "0.0.0.0:8099".parse().unwrap();
+        assert!(!origin_allowed(&headers(&[("host", "192.0.2.10:1935")]), bind), "端口不一致");
+        assert!(!origin_allowed(&headers(&[("host", "nas.example.com:8099")]), bind), "域名不接受，防 DNS 重绑定");
+        assert!(!origin_allowed(&headers(&[("host", "192.0.2.10")]), bind), "没写端口不行");
+        let cross = headers(&[("host", "192.0.2.10:8099"), ("origin", "http://evil.example")]);
+        assert!(!origin_allowed(&cross, bind), "别的网站发起的请求要拒绝");
+    }
 }

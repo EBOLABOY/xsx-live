@@ -33,8 +33,18 @@ fn dimensions(s:&[u8])->Result<(u32,u32)>{
  let width=w.saturating_sub((left+right)*cx);let height=((2-frame)*hm*16).saturating_sub((top+bottom)*cy);
  if width==0||height==0||width>8192||height>8192{bail!("Invalid source dimensions");}Ok((width,height))
 }
-struct Clock{first:Option<(u64,u64)>}
-impl Clock{fn timestamp(&mut self,data:&MediaData,elapsed:u64)->u64{let now=data.time.as_micros();let(src,out)=*self.first.get_or_insert((now,elapsed));out.saturating_add(now.saturating_sub(src)) /1000}}
+// 把源时间戳换算成输出时间戳（毫秒）。主机重新配置编码器后源时间戳可能从头开始，
+// 这时重新对齐，让输出时间戳保持单调递增
+struct Clock{first:Option<(u64,u64)>,last:Option<(u64,u64)>}
+impl Clock{fn timestamp(&mut self,data:&MediaData,elapsed:u64)->u64{
+ const SOURCE_REWIND_US:u64=1_000_000;
+ let source=data.time.as_micros();let(src,out)=*self.first.get_or_insert((source,elapsed));
+ let mut stamp=out.saturating_add(source.saturating_sub(src));
+ if self.last.is_some_and(|(last_in,_)|source.saturating_add(SOURCE_REWIND_US)<last_in){
+  stamp=self.last.map_or(stamp,|(_,last_out)|last_out+1000);self.first=Some((source,stamp));
+ }
+ self.last=Some((source,stamp));stamp/1000
+}}
 pub struct MediaRelay{
  child:Child,pipe:ChildStdin,started:Instant,video_clock:Clock,audio_clock:Clock,sps:Vec<u8>,pps:Vec<u8>,ready:bool,await_key:bool,cluster:Option<u64>,queued_audio:VecDeque<(u64,Vec<u8>)>,pub video_frames:u64,pub audio_packets:u64
 }
@@ -45,7 +55,7 @@ impl MediaRelay{
   let err=OpenOptions::new().create(true).append(true).mode(0o600).open(log)?;
   let mut child=Command::new("/usr/bin/ffmpeg").args(["-hide_banner","-nostdin","-loglevel","warning","-fflags","+genpts+discardcorrupt","-analyzeduration","1000000","-probesize","2000000","-f","matroska","-i","pipe:0","-map","0:v:0","-map","0:a:0","-c:v","copy","-c:a","aac","-ar","48000","-ac","2","-b:a","160k","-af","aresample=async=1:first_pts=0","-max_interleave_delta","1000000","-flvflags","no_duration_filesize","-f","flv","-rw_timeout","8000000"]).arg(url).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(err).spawn()?;
   let pipe=child.stdin.take().expect("piped FFmpeg input");
-  Ok(Self{child,pipe,started:Instant::now(),video_clock:Clock{first:None},audio_clock:Clock{first:None},sps:vec![],pps:vec![],ready:false,await_key:true,cluster:None,queued_audio:VecDeque::new(),video_frames:0,audio_packets:0})
+  Ok(Self{child,pipe,started:Instant::now(),video_clock:Clock{first:None,last:None},audio_clock:Clock{first:None,last:None},sps:vec![],pps:vec![],ready:false,await_key:true,cluster:None,queued_audio:VecDeque::new(),video_frames:0,audio_packets:0})
  }
  fn header(&mut self)->Result<()>{
   let(w,h)=dimensions(&self.sps)?;
@@ -66,7 +76,11 @@ impl MediaRelay{
  }
  pub fn video(&mut self,data:&MediaData)->Result<()>{
   let pts=self.video_clock.timestamp(data,self.started.elapsed().as_micros()as u64);let units=nals(&data.data);let key=data.is_keyframe()||units.iter().any(|n|n[0]&31==5);
-  for n in &units{match n[0]&31{7=>{if self.ready&&self.sps!=*n{bail!("Source video configuration changed; reconnecting");}self.sps=n.to_vec();},8=>self.pps=n.to_vec(),_=>{}}}
+  for n in &units{match n[0]&31{
+   // 主机在开播一两秒后会调整一次编码参数，挂机屏幕变暗时也会再调，每次都会重发一份 SPS。
+   // 这里接着写：新 SPS 本身就在这一帧里，播放端会自己更新，串流不会断
+   7=>{if self.ready&&self.sps!=*n{println!("VIDEO_SPS_CHANGED frames={} before={}B after={}B",self.video_frames,self.sps.len(),n.len());}self.sps=n.to_vec();},
+   8=>self.pps=n.to_vec(),_=>{}}}
   if !data.contiguous&&!key{self.await_key=true;}
   if self.await_key&&!key{return Ok(());}if self.sps.is_empty()||self.pps.is_empty(){return Ok(());}
   if !self.ready{self.header()?;while let Some((t,b))=self.queued_audio.pop_front(){self.block(2,t,true,&b)?;}}
